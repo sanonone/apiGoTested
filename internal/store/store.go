@@ -1,10 +1,11 @@
 package store
 
 import (
-	"encoding/json"
-	//"fmt"
-	"os"
-	"sync"
+	"fmt"
+	// Import "blank" per il driver. L'underscore dice a Go di eseguire
+	// solo la funzione di init() del pacchetto, che lo registra.
+	"database/sql"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // definiamo la struct Todo, lo facciamo qui perchè è strettamente
@@ -16,14 +17,21 @@ type Todo struct {
 }
 
 /*Store gestisce l'accesso ai dati dei Todo*/
+/*
 type Store struct {
 	mu       sync.RWMutex //RWMutex è più performante per letture multiple
 	todos    map[int]Todo // mappa per accesso veloce tramite ID
 	nextID   int
 	filePath string
 }
+*/
+//versione per db sqlite
+type Store struct {
+	db *sql.DB
+}
 
 // crea e inizializza una nuova istanza dello store.
+/*
 func New(filePath string) (*Store, error) {
 	s := &Store{
 		todos:    make(map[int]Todo),
@@ -32,7 +40,48 @@ func New(filePath string) (*Store, error) {
 	}
 	return s, s.load()
 }
+*/
 
+// New crea una nuova istanza dello Store e inizializza il database.
+func New(dbPath string) (*Store, error) {
+	// Apriamo la connessione al database. Se il file non esiste, viene creato.
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("errore nell'aprire il db: %w", err)
+	}
+
+	// Ping verifica che la connessione sia effettivamente valida.
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("errore nel ping del db: %w", err)
+	}
+
+	// Creiamo la tabella se non esiste.
+	if err := createTable(db); err != nil {
+		return nil, err
+	}
+
+	return &Store{db: db}, nil
+}
+
+// createTable esegue la query per creare la nostra tabella 'todos'.
+func createTable(db *sql.DB) error {
+	// Usiamo TEXT per i campi stringa e INTEGER PRIMARY KEY AUTOINCREMENT
+	// per un ID che si auto-incrementa.
+	query := `
+	CREATE TABLE IF NOT EXISTS todos (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT NOT NULL,
+		completed TEXT NOT NULL
+	);`
+
+	_, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("errore nella creazione della tabella: %w", err)
+	}
+	return nil
+}
+
+/*
 // carica i dati sul file json
 func (s *Store) load() error {
 	// RLock permette a più lettori di accedere contemporaneamente
@@ -62,7 +111,9 @@ func (s *Store) load() error {
 	return nil
 
 }
+*/
 
+/*
 // scirve lo stato corrente dello store su file
 func (s *Store) save() error {
 	s.mu.RLock() // basta un lock di lettura per creare la slice temporanea
@@ -86,8 +137,10 @@ func (s *Store) saveInternal() error {
 
 	return os.WriteFile(s.filePath, data, 0644)
 }
+*/
 
 // restituisce una slice di tutti i todo
+/*
 func (s *Store) GetAll() []Todo {
 	s.mu.RLock() //Lock in lettura, più goroutine possono leggere contemporaneamente
 	defer s.mu.RUnlock()
@@ -102,7 +155,38 @@ func (s *Store) GetAll() []Todo {
 	}
 	return allTodos
 }
+*/
+func (s *Store) GetAll() ([]Todo, error) {
+	query := "SELECT * FROM todos"
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella query get all: %w", err)
+	}
+	defer rows.Close() //fondamentale per rilasciare la connessione al database
 
+	// Creiamo una slice per contenere i risultati.
+	var todos []Todo
+
+	// Iteriamo su tutte le righe restituite.
+	for rows.Next() {
+		var t Todo
+		// Scan mappa le colonne della riga corrente nei campi della nostra struct.
+		if err := rows.Scan(&t.ID, &t.Title, &t.Completed); err != nil {
+			// Se una riga dà errore, logghiamo e continuiamo, o restituiamo l'errore.
+			return nil, fmt.Errorf("errore nello scan di una riga: %w", err)
+		}
+		todos = append(todos, t)
+	}
+
+	// Controlliamo se ci sono stati errori durante l'iterazione.
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("errore durante l'iterazione delle righe: %w", err)
+	}
+
+	return todos, nil
+}
+
+/*
 func (s *Store) GetByID(ID int) (Todo, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -112,7 +196,22 @@ func (s *Store) GetByID(ID int) (Todo, bool) {
 	return result, ok
 
 }
+*/
 
+func (s *Store) GetByID(ID int) (Todo, error) {
+	query := "SELECT * FROM todos WHERE id=?"
+
+	var newEle Todo
+	err := s.db.QueryRow(query, ID).Scan(&newEle)
+	if err != nil {
+		return Todo{}, fmt.Errorf("errore nel ritornare l'elemento cercato: %w", err)
+	}
+
+	return newEle, nil
+
+}
+
+/*
 func (s *Store) Create(title string) Todo {
 	// Usiamo un Lock() completo perché stiamo per modificare i dati (nextID e la mappa).
 	s.mu.Lock()
@@ -137,7 +236,33 @@ func (s *Store) Create(title string) Todo {
 
 	return newTodo
 }
+*/
 
+/*metodo create con sql*/
+func (s *Store) Create(title string) (Todo, error) {
+	initialStatus := "not completed"
+
+	// returning id ci ritorna l'id appena generato
+	query := "INSERT INTO todos (title, completed) VALUES (?,?) RETURNING id"
+
+	var newID int
+	/* usiamo QueryRow che è perfetta quando come ritorno ci aspettiamo una sola riga */
+	err := s.db.QueryRow(query, title, initialStatus).Scan(&newID)
+	if err != nil {
+		return Todo{}, fmt.Errorf("errore nell'inserimento del todo: %w", err)
+
+	}
+
+	newTodo := Todo{
+		ID:        newID,
+		Title:     title,
+		Completed: initialStatus,
+	}
+
+	return newTodo, nil
+}
+
+/*
 func (s *Store) Update(ID int, title string, completed string) (Todo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,7 +291,20 @@ func (s *Store) Update(ID int, title string, completed string) (Todo, bool) {
 	return newTodo, ok
 
 }
+*/
 
+func (s *Store) Update(ID int, title string, completed string) (Todo, error) {
+	query := "UPDATE todos SET title = ?, completed = ? WHERE id = ?"
+	_, err := s.db.Exec(query, title, completed, ID)
+	if err != nil {
+		return Todo{}, fmt.Errorf("errore nell'update dell'elemento: %w", err)
+	}
+
+	return s.GetByID(ID)
+
+}
+
+/*
 func (s *Store) Delete(ID int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,4 +317,26 @@ func (s *Store) Delete(ID int) bool {
 	} else {
 		return false
 	}
+}
+*/
+
+func (s *Store) Delete(ID int) error {
+	query := "DELETE FROM todos WHERE id = ?"
+	result, err := s.db.Exec(query, ID)
+	if err != nil {
+		return fmt.Errorf("errore nella cancellazione: %w", err)
+
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("errore nel recuperare le righe modificate dopo la cancellazione: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		// Nessuna riga cancellata significa ID non trovato.
+		return sql.ErrNoRows
+	}
+
+	return nil // Successo! Non c'è nulla da restituire.
 }
